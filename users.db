@@ -1,0 +1,312 @@
+import cv2
+import torch
+import tempfile
+from ultralytics import YOLO
+import streamlit as st
+from norfair import Detection, Tracker
+import numpy as np
+import pandas as pd
+import hashlib
+import sqlite3
+
+# Database setup
+def init_db():
+    conn = sqlite3.connect('users.db')
+    c = conn.cursor()
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            username TEXT PRIMARY KEY,
+            password TEXT NOT NULL,
+            email TEXT
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+# Password hashing
+def make_hashes(password):
+    return hashlib.sha256(str.encode(password)).hexdigest()
+
+def check_hashes(password, hashed_text):
+    return make_hashes(password) == hashed_text
+
+# User authentication functions
+def create_user(username, password, email):
+    conn = sqlite3.connect('users.db')
+    c = conn.cursor()
+    c.execute('INSERT INTO users(username,password,email) VALUES (?,?,?)', 
+              (username, make_hashes(password), email))
+    conn.commit()
+    conn.close()
+
+def login_user(username, password):
+    conn = sqlite3.connect('users.db')
+    c = conn.cursor()
+    c.execute('SELECT * FROM users WHERE username = ?', (username,))
+    data = c.fetchone()
+    conn.close()
+    
+    if data and check_hashes(password, data[1]):
+        return True
+    return False
+
+# Initialize database
+init_db()
+
+# Session state for authentication
+if 'authenticated' not in st.session_state:
+    st.session_state['authenticated'] = False
+if 'username' not in st.session_state:
+    st.session_state['username'] = None
+
+# Authentication UI
+def auth_ui():
+    st.title("Traffic Analysis System Login")
+    st.write("Please login to access the video classification system")
+    
+    menu = ["Login", "Sign Up"]
+    choice = st.selectbox("Menu", menu)
+    
+    if choice == "Login":
+        st.subheader("Login Section")
+        username = st.text_input("User Name")
+        password = st.text_input("Password", type='password')
+        
+        if st.button("Login"):
+            if login_user(username, password):
+                st.session_state['authenticated'] = True
+                st.session_state['username'] = username
+                st.success(f"Logged In as {username}")
+                st.rerun()
+            else:
+                st.error("Incorrect Username/Password")
+    
+    elif choice == "Sign Up":
+        st.subheader("Create New Account")
+        new_user = st.text_input("Username")
+        new_email = st.text_input("Email")
+        new_password = st.text_input("Password", type='password')
+        confirm_password = st.text_input("Confirm Password", type='password')
+        
+        if st.button("Sign Up"):
+            if new_password == confirm_password:
+                try:
+                    create_user(new_user, new_password, new_email)
+                    st.success("Account created successfully! Please login.")
+                except:
+                    st.error("Username already exists")
+            else:
+                st.error("Passwords don't match")
+
+# Inject custom CSS for better styling
+st.markdown("""
+    <style>
+    .main-title {
+        font-size: 2.5em;
+        font-weight: bold;
+        color: #1E90FF;
+        text-align: center;
+        margin-bottom: 20px;
+    }
+    .section-header {
+        font-size: 1.8em;
+        font-weight: bold;
+        color: #FF4500;
+        margin-top: 20px;
+    }
+    .info-box {
+        background-color: #F0F8FF;
+        padding: 15px;
+        border-radius: 10px;
+        margin-bottom: 15px;
+        box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+    }
+    .priority-box {
+        background-color: #E6F3FF;
+        padding: 10px;
+        border-left: 5px solid #1E90FF;
+        border-radius: 5px;
+        margin-bottom: 10px;
+    }
+    .stButton>button {
+        background-color: #1E90FF;
+        color: white;
+        border-radius: 5px;
+        padding: 10px 20px;
+    }
+    .stFileUploader {
+        background-color: #F8F9FA;
+        padding: 20px;
+        border-radius: 10px;
+        box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+    }
+    </style>
+""", unsafe_allow_html=True)
+
+# Main application
+def traffic_optimization_app():
+    # Load the models
+    yolo_v8_emergency = YOLO('best_emergency_vehicle_model.pt')
+    yolo_v5_non_emergency = torch.hub.load('ultralytics/yolov5', 'yolov5s')
+
+    # Define labels
+    emergency_labels = ['Police Car', 'Police Van', 'Fire Truck', 'Ambulance']
+    non_emergency_labels = ['car', 'bus', 'truck', 'motorcycle']
+
+    # Main title with emoji and custom styling
+    st.markdown('<div class="main-title">🚦 Traffic Flow Optimization - Emergency Vehicle Detection</div>', unsafe_allow_html=True)
+    st.write(f"Welcome, {st.session_state['username']}!")
+    
+    st.subheader("Video Classification")
+    st.markdown("### 📤 Upload Videos for Analysis")
+    
+    # File uploader for multiple videos
+    uploaded_files = st.file_uploader(
+        "Upload up to 4 videos (mp4, mov, avi, mkv)", 
+        type=["mp4", "mov", "avi", "mkv"], 
+        accept_multiple_files=True
+    )
+
+    def create_detections(results, labels, model_type="yolov8", threshold=0.85):
+        detections = []
+        if model_type == "yolov8":
+            if isinstance(results, list):
+                results = results[0]
+            if hasattr(results, 'boxes'):
+                for box in results.boxes:
+                    x1, y1, x2, y2 = map(int, box.xyxy[0])
+                    conf = box.conf[0].item()
+                    if conf < threshold:
+                        continue
+                    centroid = np.array([[(x1 + x2) / 2, (y1 + y2) / 2]])
+                    label = labels[int(box.cls)]
+                    if label in emergency_labels + non_emergency_labels:
+                        detections.append(Detection(centroid, data={
+                            "label": label, "conf": conf, "box": (x1, y1, x2, y2)
+                        }))
+        elif model_type == "yolov5":
+            if hasattr(results, 'xyxy'):
+                for result in results.xyxy[0]:
+                    if len(result) >= 6:
+                        x1, y1, x2, y2, conf, cls = result[:6]
+                        label = labels[int(cls)]
+                        centroid = np.array([[(x1 + x2) / 2, (y1 + y2) / 2]])
+                        if label in emergency_labels + non_emergency_labels:
+                            detections.append(Detection(centroid, data={
+                                "label": label, "conf": conf, "box": (int(x1), int(y1), int(x2), int(y2))
+                            }))
+        return detections
+
+    if uploaded_files:
+        video_results = []
+
+        for idx, uploaded_file in enumerate(uploaded_files[:4]):
+            st.markdown(f'<div class="section-header">🛣️ Lane {idx + 1} - {uploaded_file.name}</div>', unsafe_allow_html=True)
+            tfile = tempfile.NamedTemporaryFile(delete=False)
+            tfile.write(uploaded_file.read())
+            cap = cv2.VideoCapture(tfile.name)
+            stframe = st.empty()
+
+            emergency_detected = False
+            vehicle_counts = {
+                'car': 0, 'bus': 0, 'truck': 0, 'motorcycle': 0,
+                'Ambulance': 0, 'Fire Truck': 0, 'Police Car': 0, 'Police Van': 0
+            }
+            unique_vehicle_ids = {label: set() for label in vehicle_counts.keys()}
+            tracker = Tracker(distance_function="euclidean", distance_threshold=30)
+
+            while cap.isOpened():
+                ret, frame = cap.read()
+                if not ret:
+                    break
+
+                emergency_results = yolo_v8_emergency(frame)
+                non_emergency_results = yolo_v5_non_emergency(frame)
+
+                detections = create_detections(emergency_results, yolo_v8_emergency.names, "yolov8") + \
+                            create_detections(non_emergency_results, yolo_v5_non_emergency.names, "yolov5")
+
+                tracked_objects = tracker.update(detections)
+
+                for obj in tracked_objects:
+                    label = obj.last_detection.data["label"]
+                    x1, y1, x2, y2 = obj.last_detection.data["box"]
+
+                    if label in vehicle_counts:
+                        if obj.id not in unique_vehicle_ids[label]:
+                            unique_vehicle_ids[label].add(obj.id)
+                            vehicle_counts[label] += 1
+                            if label in emergency_labels:
+                                emergency_detected = True
+
+                    color = (0, 0, 255) if label in emergency_labels else (0, 255, 0)
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                    cv2.putText(frame, f'{label} {obj.id}', (x1, y1 - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
+
+                if frame is not None and isinstance(frame, np.ndarray):
+                    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    stframe.image(frame, channels="RGB", use_container_width=True)
+            cap.release()
+
+            # Clearance time calculations
+            T_bus = (((max(vehicle_counts['bus'], 1) * 10.5) * (max(vehicle_counts['bus'], 1) - 1) * 0.3) / 3) + (max(vehicle_counts['bus'], 1) * 0.5)
+            T_car = (((max(vehicle_counts['car'], 1) * 4.5) * (max(vehicle_counts['bus'], 1) - 1) * 0.3) / 4) + (max(vehicle_counts['bus'], 1) * 0.5)
+            T_truck = (((max(vehicle_counts['truck'], 1) * 11) * (max(vehicle_counts['bus'], 1) - 1) * 0.3) / 3) + (max(vehicle_counts['bus'], 1) * 0.5)
+            T_motorcycle = (((max(vehicle_counts['motorcycle'], 1) * 2) * (max(vehicle_counts['motorcycle'], 1) - 1) * 0.3) / 7) + (max(vehicle_counts['motorcycle'], 1) * 0.5)
+            T_ambulance = (((max(vehicle_counts['Ambulance'], 1) * 6.5) * (max(vehicle_counts['Ambulance'], 1) - 1) * 0.3) / 7) + (max(vehicle_counts['Ambulance'], 1) * 0.5)
+            T_fire_truck = (((max(vehicle_counts['Fire Truck'], 1) * 12) * (max(vehicle_counts['Fire Truck'], 1) - 1) * 0.3) / 4) + (max(vehicle_counts['Fire Truck'], 1) * 0.5)
+            T_police_car = (((max(vehicle_counts['Police Car'], 1) * 5) * (max(vehicle_counts['Police Car'], 1) - 1) * 0.3) / 7) + (max(vehicle_counts['Police Car'], 1) * 0.5)
+            T_police_van = (((max(vehicle_counts['Police Van'], 1) * 6.5) * (max(vehicle_counts['Police Van'], 1) - 1) * 0.3) / 6) + (max(vehicle_counts['Police Van'], 1) * 0.5)
+
+            clearance_time = T_bus + T_car + T_truck + T_motorcycle + T_ambulance + T_fire_truck + T_police_car + T_police_van
+
+            # Green light recommendation
+            green_light_duration = clearance_time * 1.2  # 20% buffer
+            green_light_status = "Immediate" if emergency_detected else "Standard"
+
+            video_results.append({
+                "video_name": uploaded_file.name,
+                "lane_number": idx + 1,
+                "emergency_status": "Yes" if emergency_detected else "No",
+                "vehicle_counts": vehicle_counts,
+                "clearance_time": clearance_time,
+                "green_light_duration": green_light_duration,
+                "green_light_status": green_light_status
+            })
+
+            # Display results
+            st.markdown(f"""
+            <div class="info-box">
+                <strong>🚨 Emergency Vehicle Detected:</strong> {'Yes' if emergency_detected else 'No'}<br>
+                <strong>🚗 Total Vehicles Detected:</strong> {sum(vehicle_counts.values())}<br>
+                <strong>⏱️ Clearance Time:</strong> {clearance_time:.2f} seconds<br>
+                <strong>🟢 Green Light Duration:</strong> {green_light_duration:.2f} seconds ({green_light_status})
+            </div>
+            """, unsafe_allow_html=True)
+
+        # Priority section
+        st.markdown('<div class="section-header">🔢 Priority of Lane Clearance</div>', unsafe_allow_html=True)
+        sorted_video_results = sorted(
+            video_results,
+            key=lambda x: (x['emergency_status'] == "No", -x['clearance_time'] if x['emergency_status'] == "No" else x['clearance_time'])
+        )
+
+        for priority, result in enumerate(sorted_video_results, start=1):
+            st.markdown(f"""
+            <div class="priority-box">
+                {priority}. <strong>Lane {result['lane_number']} - {result['video_name']}</strong><br>
+                Emergency: {result['emergency_status']} | Clearance Time: {result['clearance_time']:.2f}s<br>
+                Green Light: {result['green_light_duration']:.2f}s ({result['green_light_status']})
+            </div>
+            """, unsafe_allow_html=True)
+
+# Main app flow
+if not st.session_state['authenticated']:
+    auth_ui()
+else:
+    if st.sidebar.button("Logout"):
+        st.session_state['authenticated'] = False
+        st.session_state['username'] = None
+        st.rerun()
+    traffic_optimization_app()
